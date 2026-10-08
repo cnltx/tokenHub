@@ -1,0 +1,10 @@
+{
+  "listen_port": 8788,
+  "upstream_base": "http://127.0.0.1:3001",
+  "plan_enabled": true,
+  "shadow_via": "new-api",
+  "sensenova_model": "sensenova-6.8-flash-lite",
+  "shadow_max_tokens": 1024,
+  "shadow_timeout_ms": 30000,
+  "_说明": "plan_enabled 为赚取Token计划开关；影子请求通过 new-api 调用 sensenova_model，商汤 Key 由 New API 管理"
+}

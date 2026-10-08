@@ -1,0 +1,39 @@
+# tokenHub: new-api + 影子代理
+# 使用: docker compose up -d --build
+# 界面: http://127.0.0.1:3001 (new-api) / http://127.0.0.1:8788 (tokenHub)
+# 注意: 本包不包含任何个人 API Key 或 New API 数据库
+
+services:
+  new-api:
+    image: calciumion/new-api
+    container_name: new-api
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./new-api-data:/data
+    environment:
+      - TZ=Asia/Shanghai
+
+  token-earn-proxy:
+    build:
+      context: ./token-earn-proxy
+    image: token-earn-proxy:latest
+    container_name: token-earn-proxy
+    restart: unless-stopped
+    depends_on:
+      - new-api
+    ports:
+      - "8788:8788"
+    volumes:
+      - ./token-earn-proxy-data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+      - CONFIG_PATH=/app/data/config.json
+      - LISTEN_PORT=8788
+      # 容器内通过服务名访问 new-api（compose 网络）
+      - UPSTREAM_BASE=http://new-api:3000
+      # 影子请求走 new-api 的商汤模型，商汤 Key 由 New API 渠道统一管理
+      - SENSENOVA_MODEL=${SENSENOVA_MODEL:-sensenova-6.8-flash-lite}
+      # 计划默认开关（true=开）
+      - PLAN_ENABLED=${PLAN_ENABLED:-true}
