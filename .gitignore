@@ -1,0 +1,17 @@
+data/*
+!data/.gitkeep
+**/config.json
+**/config.json.bak
+**/secrets.json
+**/admin.secret
+.env
+.env.*
+!.env.example
+exports/
+backups/
+tokenhub-*.json
+docs/screenshots/
+*.lnk
+*.log
+coverage/
+.tmp/

@@ -1,0 +1,17 @@
+name: tokenhub
+services:
+  tokenhub:
+    build: .
+    image: tokenhub:local
+    container_name: tokenhub
+    init: true
+    restart: unless-stopped
+    environment:
+      TOKENHUB_HOST: 0.0.0.0
+      TOKENHUB_PORT: ${TOKENHUB_PORT:-3000}
+      TOKENHUB_PUBLIC_URL: ${TOKENHUB_PUBLIC_URL:-}
+    ports:
+      - "127.0.0.1:${TOKENHUB_PORT:-3000}:${TOKENHUB_PORT:-3000}"
+    volumes:
+      - ./data:/app/data
+    stop_grace_period: 15s

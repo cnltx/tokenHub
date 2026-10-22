@@ -1,0 +1,15 @@
+.git
+.tmp
+data
+exports
+backups
+docs/screenshots
+.env
+.env.*
+tokenhub-*.json
+**/config.json
+**/secrets.json
+**/admin.secret
+*.log
+*.lnk
+node_modules

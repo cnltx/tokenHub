@@ -1,0 +1,54 @@
+{
+  "schema_version": 2,
+  "settings": {
+    "port": 3000,
+    "max_attempts": 5,
+    "request_timeout_ms": 120000,
+    "idle_timeout_ms": 30000,
+    "max_concurrency": 16,
+    "debug_max_tokens": 2048
+  },
+  "channels": [
+    {
+      "name": "Example",
+      "base_url": "https://api.example.com/v1",
+      "keys": [
+        {
+          "value": "YOUR_UPSTREAM_API_KEY",
+          "status": "enabled"
+        }
+      ],
+      "models": [
+        "model-a",
+        "model-b"
+      ],
+      "groups": [
+        "default"
+      ],
+      "priority": 1,
+      "protocols": [
+        "chat",
+        "responses"
+      ],
+      "responses_mode": "native"
+    }
+  ],
+  "tokens": [
+    {
+      "name": "Example client",
+      "value": "YOUR_CLIENT_TOKEN",
+      "group": "default",
+      "models": [],
+      "status": "enabled"
+    }
+  ],
+  "forwarding": {
+    "enabled": false,
+    "source_models": [
+      "model-a"
+    ],
+    "target_model": "model-b",
+    "max_output_tokens": 2048,
+    "max_concurrency": 2
+  }
+}
