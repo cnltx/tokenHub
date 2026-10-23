@@ -185,14 +185,81 @@ test('tokenHub integration',{timeout:30000},async t=>{
       reply(res,200,{object:'response',model:r.body.model,output_text:'source response',usage:{input_tokens:5,output_tokens:1}});
     });try{await f.admin('/api/forwarding',{enabled:true,target_model:'b'},'PUT');const input=[{role:'user',content:[{type:'input_text',text:'hello'}]}],tools=[{type:'function',name:'demo',parameters:{type:'object'}}];const response=await f.api({model:'a',input,tools,max_output_tokens:10},'responses');assert.equal((await response.json()).model,'a');await waitUntil(()=>f.app.forwarding.snapshot().active===0);const mirror=f.received.find(r=>r.body.model==='b');assert.equal(mirror.url,'/v1/responses');assert.deepEqual(mirror.body.input,input);assert.deepEqual(mirror.body.tools,tools);}finally{await f.cleanup();}
   });
-  await t.test('exports only own config; old import, comparison and acceptance endpoints are absent',async()=>{
+  await t.test('exports only own config; external migration, comparison and acceptance endpoints are absent',async()=>{
     const f=await fixture();try{
       const safe=await f.admin('/api/export',{});assert.equal(safe.data.schema_version,2);assert.ok(!JSON.stringify(safe.data).includes('mock-key-A'));assert.ok(!Object.hasOwn(safe.data,'fanout_groups'));
       const full=await f.admin('/api/export',{include_api_keys:true});assert.equal(full.data.channels[0].keys[0].value,'mock-key-A');assert.equal(full.data.tokens[0].value,'test-client-token');
-      for(const url of ['/api/import/preview','/api/import/local-preview','/api/import/apply','/api/fanout_groups','/api/sessions'])assert.equal((await f.admin(url,{})).response.status,404);
+      for(const url of ['/api/import/local-preview','/api/import/apply','/api/fanout_groups','/api/sessions'])assert.equal((await f.admin(url,{})).response.status,404);
       assert.equal((await f.api({models:['a','b'],messages:[{role:'user',content:'hi'}]},'compare')).status,404);
       const html=await(await fetch(f.base+'/')).text();assert.ok(!/OVERVIEW|一眼了解你的网关|采纳|uni-gateway|配置与迁移/.test(html));
       assert.equal(f.app.store.config.settings.port,3000);
+    }finally{await f.cleanup();}
+  });
+  await t.test('private exports restore into a fresh installation after a read-only masked preview',async()=>{
+    const source=await fixture(),target=await fixture();try{
+      await target.admin('/api/channels/'+target.app.store.config.channels[0].id,{},'DELETE');await target.admin('/api/tokens/'+target.app.store.config.tokens[0].id,{},'DELETE');
+      await source.admin('/api/forwarding',{enabled:true,target_model:'b',source_models:['a']},'PUT');
+      const exported=(await source.admin('/api/export',{include_api_keys:true})).data;exported.settings.port=3456;
+      const before=fs.readFileSync(target.app.store.file,'utf8'),secrets=fs.readFileSync(target.app.store.secretFile,'utf8');
+      const options={config:exported,mode:'replace'},preview=await target.admin('/api/import/preview',options);assert.equal(preview.response.status,200);assert.deepEqual(preview.data.summary,{channels:1,models:2,keys:2,tokens:1});assert.ok(!JSON.stringify(preview.data).includes('mock-key-A'));assert.ok(!JSON.stringify(preview.data).includes('test-client-token'));
+      assert.equal(fs.readFileSync(target.app.store.file,'utf8'),before);assert.equal(fs.readFileSync(target.app.store.secretFile,'utf8'),secrets);
+      const applied=await target.admin('/api/import',{...options,revision:preview.data.revision});assert.equal(applied.response.status,200);assert.equal(target.app.store.config.settings.port,3000);assert.equal(target.app.store.config.forwarding.target_model,'b');
+      const restored=new ConfigStore(target.dir);assert.deepEqual(restored.config.channels[0].keys.map(k=>k.value),['mock-key-A','mock-key-B']);assert.equal(restored.config.tokens[0].value,'test-client-token');assert.ok(!fs.readFileSync(restored.file,'utf8').includes('mock-key-A'));assert.ok(!JSON.stringify(applied.data).includes('mock-key-A'));
+      const response=await target.api({model:'a',messages:[{role:'user',content:'restored'}]});assert.equal(response.status,200);await response.json();await waitUntil(()=>target.app.gateway.active===0);
+    }finally{await source.cleanup();await target.cleanup();}
+  });
+  await t.test('merge updates matching names, adds keys, retains other projects and preserves stable references',async()=>{
+    const f=await fixture();try{
+      const old=structuredClone(f.app.store.config),exported=f.app.store.export(true);
+      await f.admin('/api/channels',{name:'keep',base_url:old.channels[0].base_url,models:['keep'],keys:['keep-key'],groups:['default']});await f.admin('/api/tokens',{name:'keep-token',value:'keep-client-token'});
+      exported.channels[0].id='foreign-channel-id';exported.channels[0].keys[0].id='foreign-key-id';exported.channels[0].models.push('new-model');exported.channels[0].keys.push({value:'mock-key-C'});exported.tokens[0].id='foreign-token-id';
+      const options={config:exported},preview=await f.admin('/api/import/preview',options);assert.equal(preview.data.mode,'merge');assert.equal(preview.data.summary.channels,2);assert.equal(preview.data.changes.channels.updated,1);
+      assert.equal((await f.admin('/api/import',{...options,revision:preview.data.revision})).response.status,200);
+      const ch=f.app.store.config.channels.find(c=>c.name==='mock');assert.equal(ch.id,old.channels[0].id);assert.equal(ch.keys[0].id,old.channels[0].keys[0].id);assert.equal(ch.keys.length,3);assert.ok(ch.models.includes('new-model'));assert.equal(f.app.store.config.tokens.find(t=>t.name==='client').id,old.tokens[0].id);assert.equal(f.app.store.config.tokens.length,2);
+    }finally{await f.cleanup();}
+  });
+  await t.test('keyless exports preserve same-address keys and tokens, while fresh imports explain missing credentials',async()=>{
+    const f=await fixture();try{
+      const before=structuredClone(f.app.store.config),safe=f.app.store.export(false);safe.channels[0].keys.forEach(key=>key.id='foreign-'+key.id);safe.tokens[0].id='foreign-token';
+      let options={config:safe,mode:'replace'},preview=await f.admin('/api/import/preview',options);assert.equal(preview.response.status,200);assert.equal(preview.data.summary.keys,2);assert.equal((await f.admin('/api/import',{...options,revision:preview.data.revision})).response.status,200);assert.deepEqual(f.app.store.config.channels[0].keys,before.channels[0].keys);assert.equal(f.app.store.config.tokens[0].value,before.tokens[0].value);
+      safe.channels[0].id='new-id';safe.channels[0].name='new provider';safe.tokens[0].name='new client';options={config:safe,mode:'replace'};preview=await f.admin('/api/import/preview',options);assert.deepEqual(preview.data.summary,{channels:1,models:2,keys:0,tokens:0});assert.equal(preview.data.changes.skipped_tokens,1);assert.ok(preview.data.warnings.length>=2);assert.equal((await f.admin('/api/import',{...options,revision:preview.data.revision})).response.status,200);assert.equal(f.app.store.config.channels[0].keys.length,0);assert.equal(f.app.store.config.tokens.length,0);
+    }finally{await f.cleanup();}
+  });
+  await t.test('changing a keyless channel address never transfers existing credentials to the new host',async()=>{
+    const f=await fixture();try{
+      const config=f.app.store.export(false);config.channels[0].base_url='https://new-provider.example/v1';const options={config},preview=await f.admin('/api/import/preview',options);assert.equal(preview.data.summary.keys,0);assert.ok(preview.data.warnings.some(w=>w.includes('地址已变化')));assert.equal((await f.admin('/api/import',{...options,revision:preview.data.revision})).response.status,200);assert.equal(f.app.store.config.channels[0].keys.length,0);
+    }finally{await f.cleanup();}
+  });
+  await t.test('replace previews removals, optionally restores settings, and refuses stale or unpreviewed changes',async()=>{
+    const f=await fixture();try{
+      const config=f.app.store.export(true);config.settings.port=3456;config.settings.max_attempts=7;config.tokens=[];
+      const options={config,mode:'replace',include_settings:true};let preview=await f.admin('/api/import/preview',options);assert.equal(preview.data.changes.tokens.removed,1);assert.equal((await f.admin('/api/import',options)).response.status,409);
+      await f.admin('/api/settings',{max_attempts:4},'PUT');assert.equal((await f.admin('/api/import',{...options,revision:preview.data.revision})).response.status,409);assert.equal(f.app.store.config.settings.max_attempts,4);
+      preview=await f.admin('/api/import/preview',options);const applied=await f.admin('/api/import',{...options,revision:preview.data.revision});assert.equal(applied.response.status,200);assert.equal(applied.data.restart_required,true);assert.equal(f.app.store.config.settings.port,3456);assert.equal(f.app.store.config.settings.max_attempts,7);assert.equal(f.app.store.config.tokens.length,0);assert.ok(JSON.parse(fs.readFileSync(f.app.store.file+'.bak','utf8')).tokens.length===1);
+    }finally{await f.cleanup();}
+  });
+  await t.test('invalid imports are atomic and management import mutations require CSRF and same origin',async()=>{
+    const f=await fixture();try{
+      const config=f.app.store.export(true),before=fs.readFileSync(f.app.store.file,'utf8'),secrets=fs.readFileSync(f.app.store.secretFile,'utf8');
+      const invalid=[null,{}, {...config,schema_version:1},{...config,channels:{}},{...config,channels:[null]},{...config,channels:[{...config.channels[0],keys:[null]}]},{...config,channels:[{...config.channels[0],models:'bad'}]},{...config,channels:[config.channels[0],config.channels[0]]},{...config,channels:[{...config.channels[0],keys:['duplicate-key','duplicate-key']}]},{...config,channels:[{...config.channels[0],base_url:'invalid'}]},{...config,forwarding:{source_models:{}}}];
+      for(const value of invalid){const response=await f.admin('/api/import/preview',{config:value});assert.equal(response.response.status,400);}
+      const valid=await f.admin('/api/import/preview',{config});assert.equal((await f.admin('/api/import',{config:invalid.at(-1),revision:valid.data.revision})).response.status,400);
+      assert.equal((await f.admin('/api/import/preview',null,'POST')).response.status,400);
+      for(const endpoint of ['/api/import/preview','/api/import']){
+        assert.equal((await fetch(f.base+endpoint,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({config})})).status,403);
+        assert.equal((await fetch(f.base+endpoint,{method:'POST',headers:{'content-type':'application/json','x-csrf-token':f.csrf,origin:'https://other.example'},body:JSON.stringify({config})})).status,403);
+      }
+      assert.equal(fs.readFileSync(f.app.store.file,'utf8'),before);assert.equal(fs.readFileSync(f.app.store.secretFile,'utf8'),secrets);
+    }finally{await f.cleanup();}
+  });
+  await t.test('import apply waits for primary, forwarded and batch work to finish',async()=>{
+    const f=await fixture((req,res,r)=>complete(res,r.body,'running',400));try{
+      const options={config:f.app.store.export(true)},preview=await f.admin('/api/import/preview',options);
+      const response=await f.api({model:'a',messages:[{role:'user',content:'running'}],stream:true});assert.equal(f.app.gateway.active,1);assert.equal((await f.admin('/api/import',{...options,revision:preview.data.revision})).response.status,409);await response.text();await waitUntil(()=>f.app.gateway.active===0);
+      f.app.batch.current={running:true};assert.equal((await f.admin('/api/import',{...options,revision:preview.data.revision})).response.status,409);f.app.batch.current.running=false;
+      await f.admin('/api/forwarding',{enabled:true,target_model:'b'},'PUT');const primary=await f.api({model:'a',messages:[{role:'user',content:'forwarded'}]});await primary.json();await waitUntil(()=>f.app.forwarding.snapshot().active===1);assert.equal(f.app.gateway.primaryActive,0);assert.equal((await f.admin('/api/import',{...options,revision:preview.data.revision})).response.status,409);await waitUntil(()=>f.app.gateway.active===0);
+      preview.data=(await f.admin('/api/import/preview',options)).data;
+      assert.equal((await f.admin('/api/import',{...options,revision:preview.data.revision})).response.status,200);
     }finally{await f.cleanup();}
   });
   await t.test('a running background call cannot occupy the primary request capacity',async()=>{

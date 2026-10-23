@@ -23,6 +23,8 @@ CLI：`node src/cli.js start --open`、`status`、`ui`、`stop`。端口优先�
 | PUT | /api/settings | 局部更新设置，端口更改需重启 |
 | PUT | /api/forwarding | 更新 enabled/source_models/target_model/max_output_tokens/max_concurrency |
 | POST | /api/export | include_api_keys=true 导出含 Key 配置，默认脱敏 |
+| POST | /api/import/preview | config 为自身 schema 2 导出对象；mode=merge/replace，include_settings 默认 false，返回只读摘要与 revision |
+| POST | /api/import | 相同参数及预览返回的 revision，空闲时校验并应用；过期预览或正在调用返回409 |
 | POST/PUT/DELETE | /api/channels[/ID] | 渠道管理 |
 | POST | /api/channels/ID/discover | 从上游显式拉模型 |
 | POST | /api/channels/ID/keys/KEY_ID/test | 连通性测试 |
@@ -38,6 +40,8 @@ CLI：`node src/cli.js start --open`、`status`、`ui`、`stop`。端口优先�
 | POST | /api/shutdown | 正常停止所属服务 |
 
 普通列表不返回明文凭据；只有专用查看与明确选择的含 Key 导出返回完整值。请求体上限 4 MB；日志不记正文。导出下载文件默认 tokenhub-*.json，Git 已忽略。
+
+导入界面限制文件 3 MB，为请求包装保留空间。预览与应用都校验 CSRF/Origin；只处理上传的 tokenHub JSON，不读取项目外目录或其他项目的配置。合并按 ID/名称匹配并保留未包含的渠道、Key 和令牌；替换移除未包含的渠道与令牌。无凭据文件保留同地址匹配渠道的本机 Key；新渠道只导入模型并提示补 Key，新令牌缺值则跳过。不把旧 Key 复制到变化的上游地址。默认保留运行设置，用量与日志保持独立。应用复用 ConfigStore 的先凭据、后原子元数据保存和单份配置备份。
 
 ## 行为与排障
 

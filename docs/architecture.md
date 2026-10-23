@@ -13,7 +13,8 @@ flowchart LR
 ```
 
 - config.js：schema 2、稳定 ID、配置/凭据分离、脱敏导出。新安装默认 3000 端口；读取旧版本自身配置时去掉废弃字段并保留现有模型及凭据。
-- server.js：免登录管理与自动 CSRF、Host/Origin 校验、标准 API、导出、单模型接口测试。
+- import-config.js：自身配置格式校验、合并/替换计划、凭据保留边界、无密钥预览及配置版本冲突检查；通过 ConfigStore 保存完整校验后的结果。
+- server.js：免登录管理与自动 CSRF、Host/Origin 校验、标准 API、配置导入/导出、单模型接口测试。
 - gateway.js：令牌权限、模型映射、优先级/同级权重、Key 轮询、HTTP/SSE、期限和取消。
 - forwarding.js：源模型匹配、可选目标、独立并发、异步执行和元数据状态。直接调用 Gateway，不重入 HTTP，防止递归。
 - batch.js：显式有限测试，最多 100 次/五分钟。

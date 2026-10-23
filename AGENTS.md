@@ -6,5 +6,6 @@
 - Authorize source and target with the same client identity. Keep background concurrency and health state separate from primary capacity/health. Client cancellation and shutdown abort active requests.
 - data/, .tmp/, credentials, environment files, exports, and screenshots are private generated state. Verify Git and Docker exclusions before packaging.
 - Run node scripts/check.js and node test/run.js. Tests use local mock providers, never real model API keys.
+- After each completed and verified project change, commit and push to origin/main as requested by the user. Check the diff and private-state exclusions before every push; never include personal configuration or credentials.
 - Windows shortcuts invoke wscript/Node with hidden console; Docker uses Compose and persistent data. Keep the two modes from writing the same data concurrently.
 - Management is login-free: no accounts, passwords, cookies, or admin secret. Keep automatic CSRF and Host/Origin checks; inference still requires its client token.

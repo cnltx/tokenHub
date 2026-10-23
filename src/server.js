@@ -4,6 +4,7 @@ const fs=require('node:fs');
 const path=require('node:path');
 const crypto=require('node:crypto');
 const {ConfigStore}=require('./config');
+const {prepareImport,importConfig}=require('./import-config');
 const {Telemetry}=require('./telemetry');
 const {Gateway,writeChunk}=require('./gateway');
 const {Batch}=require('./batch');
@@ -83,6 +84,12 @@ function createApp({dataDir=path.join(__dirname,'..','data'),port,host=process.e
         if(p==='/api/stats.csv' && method==='GET') {res.writeHead(200,{'content-type':'text/csv; charset=utf-8','content-disposition':'attachment; filename=tokenhub-usage.csv','cache-control':'no-store'});return res.end(telemetry.csv(url.searchParams.get('dimension')||'model'));}
         if(p==='/api/settings' && method==='PUT') {const body=await jsonBody(req);const next=structuredClone(store.config);next.settings={...next.settings,...body};store.update(next);return json(res,200,{settings:store.config.settings,restart_required:store.config.settings.port!==actualPort});}
         if(p==='/api/export' && method==='POST'){const body=await jsonBody(req);return json(res,200,store.export(body.include_api_keys===true));}
+        if(p==='/api/import/preview' && method==='POST')return json(res,200,prepareImport(store,await jsonBody(req)).preview);
+        if(p==='/api/import' && method==='POST'){
+          const body=await jsonBody(req);
+          if(gateway.active||batch.current?.running)throw new HttpError(409,'请等待当前模型调用和批量测试结束后再导入','import_busy');
+          const result=importConfig(store,body);return json(res,200,{...result,restart_required:store.config.settings.port!==actualPort});
+        }
         if(p==='/api/forwarding' && method==='PUT'){const next=structuredClone(store.config);next.forwarding={...next.forwarding,...await jsonBody(req)};store.update(next);return json(res,200,store.config.forwarding);}
         if(p==='/api/debug/run' && method==='POST'){
           const body=await jsonBody(req);const identity={id:'admin',admin:true,group:body.group||'*',models:[]};

@@ -58,9 +58,13 @@ Base URL：`http://127.0.0.1:3000/v1`。API Key 使用设置页的客户端令�
 
 原生协议透传上游支持的工具、reasoning 和多模态字段；显式 Responses→Chat 转换仅支持纯文本子集，工具/图片/previous_response_id 等需选择原生 Responses 渠道。无上游 usage 时标为未知，缓存命中是输入 Token 子集。
 
-## 配置导出与 Git
+## 配置导入、导出与 Git
 
-设置页只保留两种导出：模型配置（不含 API Key）、模型配置与 API Key。导出使用 tokenHub 自身的 schema_version=2 格式，示例见 config.example.json。
+设置页支持导入 tokenHub 自身 schema_version=2 JSON，并提供模型配置（不含 API Key）、模型配置与 API Key 两种导出。
+
+点击“导入配置”选择文件（最大 3 MB），预览渠道、模型、Key、客户端令牌及增删数量后确认。默认合并：按 ID 或名称更新，保留文件未包含的项目；替换模式会移除文件未包含的渠道和令牌。含 Key 文件可完整恢复；不含 Key 时保留本机同地址渠道已有的 Key，新渠道需补 Key，无凭据且本机不存在的令牌会跳过并提示。渠道地址变化时不会自动带走原有 Key。
+
+转发规则随文件导入；运行设置默认保留，勾选后才恢复，端口变更需重启。用量记录保留，当前调用与批量测试结束后才能应用。文件无效或预览后配置发生变化时拒绝导入，保存沿用原子写入和上一版备份。示例见 config.example.json。
 
 真实配置、密钥、日志和统计集中在 data/，不与项目外目录关联。以下内容已被 .gitignore 排除：
 
@@ -70,6 +74,8 @@ Base URL：`http://127.0.0.1:3000/v1`。API Key 使用设置页的客户端令�
 - 本地界面截图目录。
 
 config.example.json 和 .env.example 只包含占位值，可纳入源码。仓库初始化后可用 `git status --ignored` 核对，不要用 `git add -f` 强制加入私有数据。
+
+开发约定：每完成并验证一项修改后提交、推送 origin/main；上传前检查差异及私有文件排除规则。
 
 ## 验证与文档
 

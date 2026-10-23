@@ -15,7 +15,7 @@ description: 维护 tokenHub 独立 AI 网关的模型转发、渠道和 Key、�
 
 ## 配置和数据
 
-config.json 为非密钥元数据、secrets.json 为凭据引用；后台免登录，无账号、密码和管理密钥，保留同源及透明 CSRF 校验；使用稳定 ID，专用查看/导出以外保持脱敏。导出只用自身配置，不关联项目外目录。
+config.json 为非密钥元数据、secrets.json 为凭据引用；后台免登录，无账号、密码和管理密钥，保留同源及透明 CSRF 校验；使用稳定 ID，专用查看/导出以外保持脱敏。导入/导出只用自身 schema 2 JSON，不关联项目外目录；修改导入时读取运维 API 文档中的合并、替换、缺失凭据和版本冲突边界。
 
 data、临时数据、环境文件、导出和本地截图属于私有状态。打包或建仓时检查 .gitignore/.dockerignore 与待提交文件；保持 config.example.json/.env.example 为占位示例。
 

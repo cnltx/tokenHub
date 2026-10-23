@@ -31,6 +31,24 @@ function fillForwarding(){
   form.querySelectorAll('[name=source_models]').forEach(el=>el.checked=rule.source_models.includes(el.value));$('#forward-source-list').hidden=!rule.source_models.length;
 }
 async function exportConfig(includeKeys){const data=await request('/api/export',{include_api_keys:includeKeys});download(`tokenhub-${includeKeys?'private-config':'model-config'}-${new Date().toISOString().slice(0,10)}.json`,JSON.stringify(data,null,2));toast('配置已导出');}
+function importForm(){
+  dialog('导入配置',`<form class="dialog-form"><label>tokenHub 配置文件<input id="import-file" type="file" accept=".json,application/json" required></label><p class="muted small">支持本项目导出的 JSON，最大 3 MB。含 API Key 的文件可恢复凭据；不含 Key 时，仅保留本机同地址渠道已有的 Key，新渠道需另行添加。</p><label>导入方式<select name="mode"><option value="merge">合并：更新同名项目，保留未包含的项目</option><option value="replace">替换：移除文件未包含的渠道和令牌</option></select></label><div class="check-row"><label><input name="include_settings" type="checkbox">同时恢复文件中的运行设置</label></div><p class="muted small">导入渠道、模型、Key、客户端令牌及转发规则。用量记录保留；端口变更需重启。</p><div class="dialog-actions"><button class="btn" type="button" data-action="close-dialog">取消</button><button class="btn primary" type="submit">预览导入</button></div></form>`);
+  $('#dialog-body form').addEventListener('submit',async ev=>{
+    ev.preventDefault();const form=ev.target,button=form.querySelector('[type=submit]');button.disabled=true;
+    try{
+      const file=$('#import-file').files[0];if(!file)throw new Error('请选择配置文件');if(file.size>3*1024*1024)throw new Error('配置文件超过 3 MB');
+      let imported;try{imported=JSON.parse((await file.text()).replace(/^\uFEFF/,''));}catch{throw new Error('配置文件不是有效 JSON');}
+      const fields=new FormData(form),payload={config:imported,mode:fields.get('mode'),include_settings:fields.has('include_settings')};
+      const preview=await request('/api/import/preview',payload);importPreview(file.name,payload,preview);
+    }catch(error){toast(error.message,true);}finally{button.disabled=false;}
+  });
+}
+function importPreview(filename,payload,preview){
+  const {summary,changes,warnings}=preview;
+  const changeText=(name,row)=>`${name}：新增 ${row.added} · 更新 ${row.updated} · 移除 ${row.removed}`;
+  dialog('确认导入配置',`<form class="dialog-form"><p class="muted small">${h(filename)} · ${preview.mode==='replace'?'替换现有配置':'合并配置'}</p><div class="notice">导入后：${summary.channels} 个渠道 · ${summary.models} 个模型 · ${summary.keys} 个 Key · ${summary.tokens} 个客户端令牌</div><div class="stack small"><p>${h(changeText('渠道',changes.channels))}</p><p>${h(changeText('客户端令牌',changes.tokens))}</p><p>运行设置：${preview.include_settings?'同时恢复，端口变更需重启':'保留当前设置'}</p></div><div class="model-picker">${payload.config.channels.map(ch=>`<div><strong>${h(ch.name)}</strong><div class="muted small">${h(ch.base_url)}</div></div>`).join('')||'<p class="muted small">文件未包含渠道</p>'}</div>${warnings.length?`<div class="notice small">${warnings.map(h).join('<br>')}</div>`:''}${preview.mode==='replace'?'<p class="red small">确认后，文件未包含的渠道及客户端令牌将被移除。</p>':''}<div class="dialog-actions"><button class="btn" type="button" data-action="import-config">重新选择</button><button class="btn primary" type="submit">确认${preview.mode==='replace'?'替换':'合并'}导入</button></div></form>`);
+  bindDialogSubmit(async()=>{const result=await request('/api/import',{...payload,revision:preview.revision});await refresh();fillSettings();toast(result.restart_required?'配置已导入，端口变更需重启':'配置已导入');});
+}
 function renderDebug(){
   if(!S.debug)return;$('#debug-result').hidden=false;$('#debug-result-model').textContent=S.debug.model;$('#debug-result-text').textContent=S.debug.content||S.debug.error||'等待上游输出…';$('#debug-reasoning').textContent=S.debug.reasoning;$('#debug-reasoning-box').hidden=!S.debug.reasoning;
   $('#debug-result-meta').textContent=S.generating?'生成中':`${S.debug.ms?fmt(S.debug.ms)+'ms · ':''}${S.debug.usage?compact(S.debug.usage.output)+' 输出 Token':'用量未知'}`;
@@ -88,6 +106,7 @@ function download(name,text,type='application/json'){const url=URL.createObjectU
 document.addEventListener('click',async ev=>{const tab=ev.target.closest('[data-tab]');if(tab){selectTab(tab.dataset.tab);if(S.tab==='settings')fillSettings();return;}const button=ev.target.closest('[data-action]');if(!button||button.disabled)return;const {action,id:objectId,key,turn,model}=button.dataset;try{
   if(action==='go-forwarding'){document.querySelector('#forwarding-form').scrollIntoView({block:'center'});return;}
   if(action==='export-config')return await exportConfig(false);
+  if(action==='import-config')return importForm();
   if(action==='export-private')return confirmAction('导出模型配置与 API Key','文件包含你的上游 API Key 和客户端令牌。',()=>exportConfig(true),'导出');
   if(action==='close-dialog')return closeDialog();
   if(action==='remove-existing-key')return button.closest('[data-existing-key]').remove();
