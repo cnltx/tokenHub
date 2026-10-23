@@ -25,7 +25,7 @@ async function fixture(handler){
   const dir=fs.mkdtempSync(path.join(tmpRoot,'test-'));
   fs.writeFileSync(path.join(dir,'admin.secret'),'legacy-unused-management-key');
   const app=createApp({dataDir:dir,port:0});
-  app.store.update({settings:{...app.store.config.settings,max_attempts:5},channels:[{name:'mock',base_url:`http://127.0.0.1:${upstream.address().port}/v1`,models:['a','b'],groups:['default'],keys:['mock-key-A','mock-key-B']}],tokens:[{name:'client',value:'test-client-token',group:'default'}]});
+  app.store.update({settings:{...app.store.config.settings,max_attempts:1,retry_interval_ms:100},channels:[{name:'mock',base_url:`http://127.0.0.1:${upstream.address().port}/v1`,models:['a','b'],groups:['default'],keys:['mock-key-A','mock-key-B']}],tokens:[{name:'client',value:'test-client-token',group:'default'}]});
   await app.listen();
   const base=`http://127.0.0.1:${app.port}`;
   const session=await fetch(base+'/api/session');
@@ -57,6 +57,28 @@ test('tokenHub integration',{timeout:30000},async t=>{
       await f.admin('/api/tokens/'+token.id,{status:'disabled'},'PUT');assert.equal((await f.api({model:'a',messages:[{role:'user',content:'hi'}]})).status,401);
     }finally{await f.cleanup();}
   });
+  await t.test('a key receives its complete ten-attempt budget before falling back to the next key',async()=>{
+    const f=await fixture((req,res,r)=>r.key.endsWith('A')?reply(res,429,{error:'rate'}):complete(res,r.body));
+    try{await f.admin('/api/settings',{max_attempts:10,retry_interval_ms:100},'PUT');const response=await f.api({model:'a',messages:[{role:'user',content:'hi'}]});assert.equal(response.status,200);await response.json();assert.deepEqual(f.received.map(r=>r.key),[...Array(10).fill('Bearer mock-key-A'),'Bearer mock-key-B']);const [a,b]=f.app.store.config.channels[0].keys;assert.equal(f.app.telemetry.keyMetrics(a.id).fail,10);assert.equal(f.app.telemetry.keyMetrics(b.id).ok,1);assert.ok(f.app.telemetry.key(a.id).cooldown_until>Date.now());assert.equal(f.app.store.config.channels[0].keys[0].status,'enabled');assert.equal(f.app.telemetry.stats.total.requests,1);assert.equal(f.app.telemetry.stats.total.attempts,11);assert.equal(f.app.telemetry.stats.total.retries,10);}finally{await f.cleanup();}
+  });
+  await t.test('each key has an independent retry budget and all exhausted keys cool down',async()=>{
+    const f=await fixture((req,res)=>reply(res,429,{error:'rate'}));
+    try{await f.admin('/api/settings',{max_attempts:3,retry_interval_ms:100},'PUT');const response=await f.api({model:'a',messages:[{role:'user',content:'hi'}]});assert.equal(response.status,429);await response.json();assert.deepEqual(f.received.map(r=>r.key),[...Array(3).fill('Bearer mock-key-A'),...Array(3).fill('Bearer mock-key-B')]);assert.ok(f.app.store.config.channels[0].keys.every(k=>f.app.telemetry.key(k.id).cooldown_until>Date.now()));const count=f.received.length;const next=await f.api({model:'a',messages:[{role:'user',content:'hi'}]});assert.equal(next.status,503);assert.equal(f.received.length,count);}finally{await f.cleanup();}
+  });
+  await t.test('Retry-After holds the same key, clears failures on success, and reports a waiting request',async()=>{
+    const times=[];const f=await fixture((req,res,r)=>{times.push(Date.now());if(times.length===1)return reply(res,429,{error:'rate'},{'retry-after':'1'});complete(res,r.body);});
+    try{await f.admin('/api/settings',{max_attempts:3,retry_interval_ms:100},'PUT');const pending=f.api({model:'a',messages:[{role:'user',content:'hi'}]});await waitUntil(()=>f.received.length===1);const key=f.app.store.config.channels[0].keys[0];await waitUntil(()=>f.app.gateway.keyActivity(key.id).retrying===1);assert.equal(f.app.gateway.keyActivity(key.id).active,1);const response=await pending;assert.equal(response.status,200);await response.json();assert.deepEqual(f.received.map(r=>r.key),['Bearer mock-key-A','Bearer mock-key-A']);assert.ok(times[1]-times[0]>=950);assert.equal(f.app.telemetry.key(key.id).cooldown_until,0);assert.equal(f.app.telemetry.keyMetrics(key.id).fail,1);assert.equal(f.app.telemetry.keyMetrics(key.id).ok,1);}finally{await f.cleanup();}
+  });
+  await t.test('cancel and overall deadline interrupt retry waits without trying another key',async()=>{
+    const f=await fixture((req,res)=>reply(res,429,{error:'rate'},{'retry-after':'60'}));
+    try{await f.admin('/api/settings',{max_attempts:10,retry_interval_ms:100},'PUT');const controller=new AbortController();const pending=fetch(f.base+'/v1/chat/completions',{method:'POST',headers:{authorization:'Bearer test-client-token','content-type':'application/json'},body:JSON.stringify({model:'a',messages:[{role:'user',content:'hi'}]}),signal:controller.signal}).catch(()=>{});await waitUntil(()=>f.received.length===1);controller.abort();await pending;await waitUntil(()=>f.app.gateway.active===0);assert.equal(f.received.length,1);assert.equal(f.app.gateway.activeKeys.size,0);for(const key of f.app.store.config.channels[0].keys)f.app.telemetry.resetKey(key.id);await f.admin('/api/settings',{request_timeout_ms:1000},'PUT');const start=Date.now();const response=await f.api({model:'a',messages:[{role:'user',content:'timeout'}]});assert.equal(response.status,504);await response.json();assert.ok(Date.now()-start<2000);assert.equal(f.received.length,2);assert.equal(f.app.gateway.activeKeys.size,0);}finally{await f.cleanup();}
+  });
+  await t.test('connections, credentials and parameters all use the configured per-key budget',async()=>{
+    for(const mode of ['network','server','auth','parameter']){
+      let calls=0;const f=await fixture((req,res,r)=>{calls++;if(mode==='auth'&&r.key.endsWith('A'))return reply(res,401,{error:'invalid'});if(mode==='parameter')return reply(res,400,{error:'invalid parameter'});if(calls===1){if(mode==='network')return res.destroy();if(mode==='server')return reply(res,503,{error:'temporary'});}complete(res,r.body);});
+      try{await f.admin('/api/settings',{max_attempts:3,retry_interval_ms:100},'PUT');const response=await f.api({model:'a',messages:[{role:'user',content:'hi'}]});assert.equal(response.status,mode==='parameter'?400:200);await response.json();assert.deepEqual(f.received.map(r=>r.key),mode==='parameter'?[...Array(3).fill('Bearer mock-key-A'),...Array(3).fill('Bearer mock-key-B')]:mode==='auth'?[...Array(3).fill('Bearer mock-key-A'),'Bearer mock-key-B']:['Bearer mock-key-A','Bearer mock-key-A']);}finally{await f.cleanup();}
+    }
+  });
   await t.test('key polling, native Chat fields, model alias and exact usage',async()=>{
     const f=await fixture();try{
       const ch=f.app.store.config.channels[0];await f.admin('/api/channels/'+ch.id,{model_mapping:{alias:'a'}},'PUT');
@@ -65,19 +87,31 @@ test('tokenHub integration',{timeout:30000},async t=>{
       const stats=f.app.telemetry.stats.total;assert.equal(stats.requests,3);assert.equal(stats.attempts,3);assert.equal(stats.input,36);assert.equal(stats.output,12);assert.equal(stats.cached,9);assert.equal(stats.reported,3);
     }finally{await f.cleanup();}
   });
-  await t.test('401 skips bad key, 429 cools keys, and exhausted pool fails immediately',async()=>{
+  await t.test('401 cooldown expires automatically, 429 cools keys, and an exhausted pool fails immediately',async()=>{
     let phase='auth';const f=await fixture((req,res,r)=>{if(phase==='auth'&&r.key.endsWith('A'))return reply(res,401,{error:'invalid'});if(phase==='rate')return reply(res,429,{error:'rate'},{'retry-after':'60'});complete(res,r.body);});
     try{
       let response=await f.api({model:'a',messages:[{role:'user',content:'hi'}]});assert.equal(response.status,200);await response.json();
       const [a,b]=f.app.store.config.channels[0].keys;assert.equal(f.app.telemetry.key(a.id).auth_error,true);assert.equal(f.received.length,2);
       response=await f.api({model:'a',messages:[{role:'user',content:'hi'}]});await response.json();assert.equal(f.received.at(-1).key,'Bearer mock-key-B');
+      phase='ok';f.app.telemetry.key(a.id).cooldown_until=Date.now()-1;response=await f.api({model:'a',messages:[{role:'user',content:'recovered'}]});assert.equal(response.status,200);await response.json();assert.equal(f.received.at(-1).key,'Bearer mock-key-A');assert.equal(f.app.telemetry.key(a.id).auth_error,false);
       phase='rate';f.app.telemetry.resetKey(a.id);response=await f.api({model:'a',messages:[{role:'user',content:'hi'}]});assert.equal(response.status,429);assert.ok(Number(response.headers.get('retry-after'))>=59);await response.json();assert.ok(f.app.telemetry.key(b.id).cooldown_until>Date.now()+55000);
       const count=f.received.length;response=await f.api({model:'a',messages:[{role:'user',content:'hi'}]});assert.equal(response.status,503);assert.equal(f.received.length,count);
     }finally{await f.cleanup();}
   });
-  await t.test('400 does not retry; priority failover attributes every upstream attempt',async()=>{
+  await t.test('400 exhausts keys; priority failover attributes every upstream attempt',async()=>{
     let phase='bad';const f=await fixture((req,res,r)=>{if(phase==='bad')return reply(res,400,{error:'bad parameter'});if(r.key.endsWith('A')||r.key.endsWith('B'))return reply(res,503,{error:'unavailable'});complete(res,r.body);});
-    try{let response=await f.api({model:'a',messages:[{role:'user',content:'hi'}]});assert.equal(response.status,400);assert.equal(f.received.length,1);phase='fallback';await f.admin('/api/channels',{name:'fallback',base_url:f.app.store.config.channels[0].base_url,priority:2,models:['a'],keys:['mock-key-C'],groups:['default']});response=await f.api({model:'a',messages:[{role:'user',content:'hi'}]});assert.equal(response.status,200);await response.json();assert.deepEqual(f.received.slice(1).map(r=>r.key),['Bearer mock-key-B','Bearer mock-key-A','Bearer mock-key-C']);assert.equal(f.app.telemetry.stats.total.requests,2);assert.equal(f.app.telemetry.stats.total.attempts,4);const channels=f.app.store.config.channels;assert.equal(f.app.telemetry.stats.dimensions.channel[channels[0].id].attempts,3);assert.equal(f.app.telemetry.stats.dimensions.channel[channels[1].id].attempts,1);}finally{await f.cleanup();}
+    try{let response=await f.api({model:'a',messages:[{role:'user',content:'hi'}]});assert.equal(response.status,400);await response.json();assert.equal(f.received.length,2);phase='fallback';for(const key of f.app.store.config.channels[0].keys)f.app.telemetry.resetKey(key.id);await f.admin('/api/channels',{name:'fallback',base_url:f.app.store.config.channels[0].base_url,priority:2,models:['a'],keys:['mock-key-C'],groups:['default']});response=await f.api({model:'a',messages:[{role:'user',content:'hi'}]});assert.equal(response.status,200);await response.json();assert.deepEqual(f.received.slice(2).map(r=>r.key),['Bearer mock-key-A','Bearer mock-key-B','Bearer mock-key-C']);assert.equal(f.app.telemetry.stats.total.requests,2);assert.equal(f.app.telemetry.stats.total.attempts,5);const channels=f.app.store.config.channels;assert.equal(f.app.telemetry.stats.dimensions.channel[channels[0].id].attempts,4);assert.equal(f.app.telemetry.stats.dimensions.channel[channels[1].id].attempts,1);}finally{await f.cleanup();}
+  });
+  await t.test('all upstream HTTP error classes retry before key failover, including redirects and vendor codes',async()=>{
+    for(const status of [300,302,304,400,401,402,403,404,408,409,422,429,500,502,503,504,529,599]){
+      const f=await fixture((req,res,r)=>r.key.endsWith('A')?reply(res,status,{error:'mock upstream error'}):complete(res,r.body));
+      try{
+        await f.admin('/api/settings',{max_attempts:2,retry_interval_ms:100},'PUT');
+        const response=await f.api({model:'a',messages:[{role:'user',content:'hi'}]});assert.equal(response.status,200,`upstream ${status}`);await response.json();
+        assert.deepEqual(f.received.map(r=>r.key),['Bearer mock-key-A','Bearer mock-key-A','Bearer mock-key-B'],`upstream ${status}`);
+        const [a,b]=f.app.store.config.channels[0].keys;assert.equal(f.app.telemetry.keyMetrics(a.id).fail,2);assert.equal(f.app.telemetry.keyMetrics(b.id).ok,1);assert.ok(f.app.telemetry.key(a.id).cooldown_until>Date.now());assert.equal(f.app.telemetry.stats.total.attempts,3);
+      }finally{await f.cleanup();}
+    }
   });
   await t.test('real Chat stream arrives before completion and UTF-8 usage parsing survives split buffers',async()=>{
     const f=await fixture((req,res,r)=>complete(res,r.body,'你好 🌍',180));try{const response=await f.api({model:'a',messages:[{role:'user',content:'hi'}],stream:true});const reader=response.body.getReader();const first=await reader.read();assert.ok(Buffer.from(first.value).toString().includes('data:'));assert.equal(f.app.gateway.active,1);const chunks=[Buffer.from(first.value)];while(true){const item=await reader.read();if(item.done)break;chunks.push(Buffer.from(item.value));}assert.ok(Buffer.concat(chunks).toString('utf8').includes('你好 🌍'));assert.equal(f.app.telemetry.stats.total.output,4);assert.equal(f.app.telemetry.stats.total.reported,1);}finally{await f.cleanup();}

@@ -44,7 +44,7 @@ class Telemetry {
   keyResult(key, status, ms, cooldown = 0, scope = '') {
     const row=this.key(scope+key.id); row.last_status=status; row.last_ms=ms; row.last_at=Date.now();
     if (status>=200 && status<300) { row.ok++; row.auth_error=false; row.cooldown_until=0; }
-    else { row.fail++; row.auth_error=status===401 || row.auth_error; row.cooldown_until=cooldown; }
+    else { row.fail++; row.auth_error=status===401; row.cooldown_until=cooldown; }
     this.dirty=true;
   }
   resetKey(id) { this.key(id);for(const [label,row]of Object.entries(this.runtime.keys))if(label===id||label.endsWith(':'+id)){row.auth_error=false;row.cooldown_until=0;}this.dirty=true; }

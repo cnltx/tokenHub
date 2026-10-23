@@ -2,7 +2,8 @@
   "schema_version": 2,
   "settings": {
     "port": 3000,
-    "max_attempts": 5,
+    "max_attempts": 10,
+    "retry_interval_ms": 1000,
     "request_timeout_ms": 120000,
     "idle_timeout_ms": 30000,
     "max_concurrency": 16,

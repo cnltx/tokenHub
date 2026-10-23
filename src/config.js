@@ -3,10 +3,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { HttpError, id, mask, readJson, atomicJson, number, list } = require('./util');
 
-const DEFAULT_SETTINGS = Object.freeze({ port: 3000, paused: false, max_attempts: 5, request_timeout_ms: 120000, idle_timeout_ms: 30000, cooldown_ms: 10000, max_concurrency: 16, log_max_mb: 5, log_retention_days: 7, debug_max_tokens: 2048 });
+const DEFAULT_SETTINGS = Object.freeze({ port: 3000, paused: false, max_attempts: 10, retry_interval_ms: 1000, request_timeout_ms: 120000, idle_timeout_ms: 30000, cooldown_ms: 10000, max_concurrency: 16, log_max_mb: 5, log_retention_days: 7, debug_max_tokens: 2048 });
 function settings(input = {}) {
   const out = { ...DEFAULT_SETTINGS };
-  for (const [field, min, max] of [['port',1,65535],['max_attempts',1,20],['request_timeout_ms',1000,600000],['idle_timeout_ms',1000,120000],['cooldown_ms',1000,3600000],['max_concurrency',1,128],['log_max_mb',1,50],['log_retention_days',1,90],['debug_max_tokens',1,8192]]) out[field] = number(input[field], out[field], min, max);
+  for (const [field, min, max] of [['port',1,65535],['max_attempts',1,20],['retry_interval_ms',100,60000],['request_timeout_ms',1000,600000],['idle_timeout_ms',1000,120000],['cooldown_ms',1000,3600000],['max_concurrency',1,128],['log_max_mb',1,50],['log_retention_days',1,90],['debug_max_tokens',1,8192]]) out[field] = number(input[field], out[field], min, max);
   out.paused = input.paused === true;
   return out;
 }

@@ -2,7 +2,7 @@
 const http = require('node:http');
 const https = require('node:https');
 const { once } = require('node:events');
-const { HttpError, id, equal, SSEParser, abortError } = require('./util');
+const { HttpError, id, equal, SSEParser, abortError, sleep } = require('./util');
 const { usageFrom } = require('./telemetry');
 const { responsesToChat, chatToResponse, ResponsesBridge } = require('./protocols');
 
@@ -32,7 +32,7 @@ class Gateway {
   constructor(store,telemetry) { this.store=store; this.telemetry=telemetry; this.active=0; this.primaryActive=0; this.controllers=new Set(); this.idleWaiters=[]; this.activeKeys=new Map(); }
   keyActivity(keyId) {
     const calls=[...this.activeKeys.values()].filter(call=>call.key_id===keyId);
-    return {active:calls.length,primary_active:calls.filter(call=>call.source!=='forward'&&call.source!=='probe').length,forward_active:calls.filter(call=>call.source==='forward').length,probe_active:calls.filter(call=>call.source==='probe').length};
+    return {active:calls.length,primary_active:calls.filter(call=>call.source!=='forward'&&call.source!=='probe').length,forward_active:calls.filter(call=>call.source==='forward').length,probe_active:calls.filter(call=>call.source==='probe').length,retrying:calls.filter(call=>call.retrying).length,next_retry_at:calls.some(call=>call.next_retry_at)?Math.min(...calls.filter(call=>call.next_retry_at).map(call=>call.next_retry_at)):null};
   }
   authenticate(header) {
     const match=/^Bearer\s+(.+)$/i.exec(header||'');
@@ -52,7 +52,7 @@ class Gateway {
     return [...all].sort().map(model=>({id:model,object:'model',created:0,owned_by:'tokenHub'}));
   }
   choose(ch,tried,forcedKeyId,scope='') {
-    const keys=ch.keys.filter(k=>k.status==='enabled' && (!forcedKeyId || k.id===forcedKeyId) && !tried.has(k.id) && !this.telemetry.key(scope+k.id).auth_error && this.telemetry.key(scope+k.id).cooldown_until<=Date.now());
+    const keys=ch.keys.filter(k=>k.status==='enabled' && (!forcedKeyId || k.id===forcedKeyId) && !tried.has(k.id) && this.telemetry.key(scope+k.id).cooldown_until<=Date.now());
     if (!keys.length) return null;
     if (ch.key_mode==='random') return keys[Math.floor(Math.random()*keys.length)];
     const start=this.telemetry.runtime.cursors[ch.id] || 0;
@@ -82,77 +82,92 @@ class Gateway {
         const upstreamEndpoint=bridge?'chat/completions':endpoint;
         const template=bridge?responsesToChat(body):{...body};
         let key;
-        while (attempts<settings.max_attempts && (key=this.choose(ch,tried,forcedKeyId,healthScope))) {
+        while ((key=this.choose(ch,tried,forcedKeyId,healthScope))) {
           if (combined.aborted) throw abortError(combined);
-          tried.add(key.id); attempts++; selectedChannel=ch; selectedKey=key;
-          this.telemetry.attempt(ch,key,attempts>1,healthScope);
-          const attemptStarted=Date.now();let recorded=false;
-          this.activeKeys.set(trace,{key_id:key.id,source});
-          const recordResult=(code,cooldown=0)=>{if(recorded)return;recorded=true;this.telemetry.keyResult(key,code,Date.now()-attemptStarted,cooldown,healthScope);};
+          tried.add(key.id); selectedChannel=ch; selectedKey=key;
+          const activity={key_id:key.id,source,retrying:false,next_retry_at:null};
+          this.activeKeys.set(trace,activity);
           try {
-            const requestBody={...template,model:ch.model_mapping[body.model] || body.model};
-            if (requestBody.stream && upstreamEndpoint==='chat/completions') requestBody.stream_options={...requestBody.stream_options,include_usage:true};
-            let upstream;
-            try { upstream=await openRequest(ch,key,upstreamEndpoint,requestBody,combined,settings.idle_timeout_ms); }
-            catch (error) {
+            for(let keyAttempt=1;keyAttempt<=settings.max_attempts;keyAttempt++){
               if (combined.aborted) throw abortError(combined);
-              recordResult(error.status||0,Date.now()+settings.cooldown_ms);
-              failure=new HttpError(error.status||502,error.status===504?'上游连接超时':'连接上游失败','upstream_connection_error');
-              continue;
-            }
-            status=upstream.statusCode;
-            if (status<200 || status>=300) {
-              // Drain without logging or exposing request/credential-bearing provider bodies.
-              try { await readLimited(upstream,1024*1024); } catch (error) { if (combined.aborted) throw abortError(combined); }
-              const until=status===429?Date.now()+cooldownMs(upstream.headers['retry-after'],settings.cooldown_ms):status>=500?Date.now()+settings.cooldown_ms:0;
-              recordResult(status,until);
-              const retryAfter=status===429?{'retry-after':String(Math.max(1,Math.ceil((until-Date.now())/1000)))}:{};
-              failure=new HttpError(status,`上游返回 HTTP ${status}${status===401?'，此 Key 已标为鉴权异常':status===429?'，此 Key 正在冷却':''}`,'upstream_error',retryAfter);
-              if (status===401 || status===408 || status===429 || status>=500) continue;
-              throw failure;
-            }
-            // Once a successful upstream response is accepted, no replay occurs after a stream/body failure.
-            let data;
-            if (body.stream===true) {
-              if (!String(upstream.headers['content-type']||'').includes('text/event-stream')) { upstream.destroy(); throw new HttpError(502,'上游没有返回 SSE，请检查渠道协议能力','invalid_stream'); }
-              let terminal=false, streamError=null, bytes=0;
-              const bridgeStream=bridge?new ResponsesBridge(body.model,(type,data)=>onEvent?.({type,data,converted:true})):null;
-              const parser=new SSEParser(record=>{
-                if (record.type==='done' || record.type==='response.completed' || record.type==='response.incomplete') terminal=true;
-                if (record.data?.error || ['error','response.failed'].includes(record.type)) streamError=new HttpError(502,'上游流返回错误','upstream_stream_error');
-                const reported=usageFrom(record.data); if (reported) usage=reported;
-                if (bridgeStream) { if (record.data) bridgeStream.consume(record.data); }
-                else onEvent?.(record);
-              });
-              onOpen?.({status,channel:ch.name,key_id:key.id,model:body.model,converted:bridge});
-              for await (const chunk of upstream) {
-                if (combined.aborted) throw abortError(combined);
-                bytes+=chunk.length; if (bytes>32*1024*1024) { upstream.destroy(); throw new HttpError(502,'上游流超过 32MB','upstream_too_large'); }
-                parser.push(chunk);
-                if (!bridge && onChunk) await onChunk(chunk);
-                if (streamError) { upstream.destroy(); throw streamError; }
+              activity.retrying=false;activity.next_retry_at=null;
+              attempts++;
+              this.telemetry.attempt(ch,key,attempts>1,healthScope);
+              const retrySame=async waitMs=>{
+                if(keyAttempt>=settings.max_attempts)return false;
+                activity.retrying=true;activity.next_retry_at=Date.now()+waitMs;
+                await sleep(waitMs,combined);
+                return true;
+              };
+              const attemptStarted=Date.now();let recorded=false;
+              const recordResult=(code,cooldown=0)=>{if(recorded)return;recorded=true;this.telemetry.keyResult(key,code,Date.now()-attemptStarted,cooldown,healthScope);};
+              try {
+                const requestBody={...template,model:ch.model_mapping[body.model] || body.model};
+                if (requestBody.stream && upstreamEndpoint==='chat/completions') requestBody.stream_options={...requestBody.stream_options,include_usage:true};
+                let upstream;
+                try { upstream=await openRequest(ch,key,upstreamEndpoint,requestBody,combined,settings.idle_timeout_ms); }
+                catch (error) {
+                  if (combined.aborted) throw abortError(combined);
+                  recordResult(error.status||0,Date.now()+settings.cooldown_ms);
+                  failure=new HttpError(error.status||502,error.status===504?'上游连接超时':'连接上游失败','upstream_connection_error');
+                  if(await retrySame(settings.retry_interval_ms))continue;
+                  break;
+                }
+                status=upstream.statusCode;
+                if (status<200 || status>=300) {
+                  // Drain without logging or exposing request/credential-bearing provider bodies.
+                  try { await readLimited(upstream,1024*1024); } catch (error) { if (combined.aborted) throw abortError(combined); }
+                  const waitMs=status===429?cooldownMs(upstream.headers['retry-after'],settings.retry_interval_ms):settings.retry_interval_ms;
+                  const until=Date.now()+Math.max(settings.cooldown_ms,waitMs);
+                  recordResult(status,until);
+                  const retryAfter=status===429?{'retry-after':String(Math.max(1,Math.ceil((until-Date.now())/1000)))}:{};
+                  failure=new HttpError(status,`上游返回 HTTP ${status}，此 Key 正在冷却`,'upstream_error',retryAfter);
+                  if(await retrySame(waitMs))continue;
+                  break;
+                }
+                // Once a successful upstream response is accepted, no replay occurs after a stream/body failure.
+                let data;
+                if (body.stream===true) {
+                  if (!String(upstream.headers['content-type']||'').includes('text/event-stream')) { upstream.destroy(); throw new HttpError(502,'上游没有返回 SSE，请检查渠道协议能力','invalid_stream'); }
+                  let terminal=false, streamError=null, bytes=0;
+                  const bridgeStream=bridge?new ResponsesBridge(body.model,(type,data)=>onEvent?.({type,data,converted:true})):null;
+                  const parser=new SSEParser(record=>{
+                    if (record.type==='done' || record.type==='response.completed' || record.type==='response.incomplete') terminal=true;
+                    if (record.data?.error || ['error','response.failed'].includes(record.type)) streamError=new HttpError(502,'上游流返回错误','upstream_stream_error');
+                    const reported=usageFrom(record.data); if (reported) usage=reported;
+                    if (bridgeStream) { if (record.data) bridgeStream.consume(record.data); }
+                    else onEvent?.(record);
+                  });
+                  onOpen?.({status,channel:ch.name,key_id:key.id,model:body.model,converted:bridge});
+                  for await (const chunk of upstream) {
+                    if (combined.aborted) throw abortError(combined);
+                    bytes+=chunk.length; if (bytes>32*1024*1024) { upstream.destroy(); throw new HttpError(502,'上游流超过 32MB','upstream_too_large'); }
+                    parser.push(chunk);
+                    if (!bridge && onChunk) await onChunk(chunk);
+                    if (streamError) { upstream.destroy(); throw streamError; }
+                  }
+                  parser.end();
+                  if (streamError) throw streamError;
+                  if (!terminal) throw new HttpError(502,'上游流提前结束，未收到完成标记','incomplete_stream');
+                  if (bridgeStream) data=bridgeStream.end(usage);
+                } else {
+                  const raw=await readLimited(upstream);
+                  try { data=JSON.parse(raw); } catch { throw new HttpError(502,'上游未返回有效 JSON','invalid_upstream_response'); }
+                  if (data.error || data.status==='failed') throw new HttpError(502,'上游返回生成错误','upstream_error');
+                  usage=usageFrom(data);
+                  if (bridge) data=chatToResponse(data,body.model);
+                }
+                recordResult(status);
+                ok=true;
+                return { data,usage,channel:ch.name,channel_id:ch.id,key_id:key.id,attempts,ms:Date.now()-started,trace };
+              } catch(error) {
+                const code=(combined.aborted?abortError(combined):error).status||502;
+                recordResult(code,code===499?0:Date.now()+settings.cooldown_ms);
+                throw error;
               }
-              parser.end();
-              if (streamError) throw streamError;
-              if (!terminal) throw new HttpError(502,'上游流提前结束，未收到完成标记','incomplete_stream');
-              if (bridgeStream) data=bridgeStream.end(usage);
-            } else {
-              const raw=await readLimited(upstream);
-              try { data=JSON.parse(raw); } catch { throw new HttpError(502,'上游未返回有效 JSON','invalid_upstream_response'); }
-              if (data.error || data.status==='failed') throw new HttpError(502,'上游返回生成错误','upstream_error');
-              usage=usageFrom(data);
-              if (bridge) data=chatToResponse(data,body.model);
             }
-            recordResult(status);
-            ok=true;
-            return { data,usage,channel:ch.name,channel_id:ch.id,key_id:key.id,attempts,ms:Date.now()-started,trace };
-          } catch(error) {
-            const code=(combined.aborted?abortError(combined):error).status||502;
-            recordResult(code,code===499?0:Date.now()+settings.cooldown_ms);
-            throw error;
           } finally { this.activeKeys.delete(trace); }
         }
-        if (attempts>=settings.max_attempts) break;
       }
       if (failure) throw failure;
       const cooldowns=routes.flatMap(ch=>ch.keys.filter(k=>k.status==='enabled').map(k=>this.telemetry.key(healthScope+k.id).cooldown_until)).filter(t=>t>Date.now());
@@ -177,7 +192,8 @@ class Gateway {
     try {
       const res=await openRequest(ch,key,'models',null,combined,15000,'GET');
       const raw=await readLimited(res,4*1024*1024);
-      this.telemetry.keyResult(key,res.statusCode,Date.now()-started,res.statusCode===429?Date.now()+cooldownMs(res.headers['retry-after'],this.store.config.settings.cooldown_ms):0);
+      const cooldown=res.statusCode>=200&&res.statusCode<300?0:Date.now()+cooldownMs(res.statusCode===429?res.headers['retry-after']:null,this.store.config.settings.cooldown_ms);
+      this.telemetry.keyResult(key,res.statusCode,Date.now()-started,cooldown);
       let models=[]; try { models=JSON.parse(raw).data?.map(m=>m.id).filter(x=>typeof x==='string')||[]; } catch { /* status remains visible; an empty list is not claimed as model support */ }
       return {ok:res.statusCode>=200&&res.statusCode<300,status:res.statusCode,ms:Date.now()-started,models};
     } catch(error) { this.telemetry.keyResult(key,error.status||0,Date.now()-started); throw combined.aborted?abortError(combined):new HttpError(502,'无法连接上游模型接口','upstream_connection_error'); }
